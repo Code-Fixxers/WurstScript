@@ -118,8 +118,14 @@ public class FunctionSignature {
 
     public static FunctionSignature fromNameLink(FuncLink f) {
         VariableBinding mapping = f.getVariableBinding();
-        mapping = mapping.withTypeVariables(f.getTypeParams());
-        return new FunctionSignature(f.getDef(), mapping, f.getReceiverType(), f.getName(), f.getParameterTypes(), getParamNames(f.getDef().getParameters()), f.getReturnType());
+        // Only add the function definition's own type parameters as type variables
+        // for inference. Enclosing structure type params (from class/module) are
+        // resolved through receiver type matching, not argument inference.
+        FunctionDefinition def = f.getDef();
+        if (def instanceof AstElementWithTypeParameters) {
+            mapping = mapping.withTypeVariables(((AstElementWithTypeParameters) def).getTypeParameters());
+        }
+        return new FunctionSignature(def, mapping, f.getReceiverType(), f.getName(), f.getParameterTypes(), getParamNames(def.getParameters()), f.getReturnType());
     }
 
 
@@ -234,14 +240,13 @@ public class FunctionSignature {
         for (int i = 0; i < argTypes.size(); i++) {
             WurstType pt = getParamType(i);
             WurstType at = argTypes.get(i);
-            mapping = at.matchAgainstSupertype(pt, location, mapping, VariablePosition.RIGHT);
             VariableBinding before = mapping;
-            VariableBinding after = at.matchAgainstSupertype(pt, location, mapping, VariablePosition.RIGHT);
+            mapping = at.matchAgainstSupertype(pt, location, mapping, VariablePosition.RIGHT);
+            VariableBinding after = mapping;
             WLogger.trace(() -> "[IMPLCONV]   vb " + System.identityHashCode(before)
                 + " -> " + (after == null ? "null" : System.identityHashCode(after))
                 + " sameObj=" + (before == after)
                 + " pt=" + pt + " at=" + at);
-            mapping = after;
             if (mapping == null) return null;
 
         }

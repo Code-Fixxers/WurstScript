@@ -1861,7 +1861,7 @@ public class WurstValidator {
                     ClassDef superOwner = (ClassDef) owner;
                     if (isStrictSuperclassOf(superOwner, c)) {
                         // produce the requested error text
-                        def.addError("Variable " + name + " in class " + c.getName()
+                        def.addWarning("Variable " + name + " in class " + c.getName()
                             + " hides variable " + name + " from superclass " + superOwner.getName());
                         // one error per conflicting ancestor is enough
                         break;
