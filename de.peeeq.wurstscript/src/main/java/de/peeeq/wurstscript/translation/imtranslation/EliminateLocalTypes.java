@@ -21,11 +21,22 @@ public class EliminateLocalTypes {
         // null string -> "" (avoids type dependency in null translation)
         // String concatenation was already lowered by LuaNativeLowering before optimization.
         // int castTo int -> remove cast (avoids type dependency in cast translation)
-        transformProgram(imProg, translator);
-        // Eliminates local types to be able to merge more locals in Lua.
-        for (ImFunction f : ImHelper.calculateFunctionsOfProg(imProg)) {
-            eliminateLocalTypesFunc(f, translator);
+        //
+        // The null/cast rewrite only touches global initializers and function bodies, so it
+        // runs per element instead of sweeping the whole program: global initializers are
+        // rewritten directly, then each function body is rewritten together with its
+        // local-type elimination. Functions are independent subtrees (each thread only
+        // mutates its own function), so they are processed concurrently.
+        for (java.util.List<ImSet> inits : imProg.getGlobalInits().values()) {
+            for (ImSet init : inits) {
+                transformElement(init);
+            }
         }
+        // Eliminates local types to be able to merge more locals in Lua, processed concurrently per function.
+        ImHelper.calculateFunctionsOfProg(imProg).parallelStream().forEach(f -> {
+            transformElement(f.getBody());
+            eliminateLocalTypesFunc(f, translator);
+        });
     }
 
     private static void eliminateLocalTypesFunc(ImFunction f, final ImTranslator translator) {
@@ -60,8 +71,8 @@ public class EliminateLocalTypes {
         return localSimpleType;
     }
 
-    private static void transformProgram(ImProg imProg, ImTranslator translator) {
-        imProg.accept(new Element.DefaultVisitor() {
+    private static void transformElement(Element element) {
+        element.accept(new Element.DefaultVisitor() {
             @Override
             public void visit(ImNull imNull) {
                 super.visit(imNull);

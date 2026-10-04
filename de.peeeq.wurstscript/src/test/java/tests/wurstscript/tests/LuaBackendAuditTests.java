@@ -4924,7 +4924,10 @@ public class LuaBackendAuditTests extends WurstScriptTest {
             "    stepped(20)",
             "    consume(readAfter(4))");
         String up = topLevelFunctionBodyWithPrefix(compiled, "up");
-        assertTrue("an ascending range is a numeric for:\n" + up, up.contains("for i = 0, "));
+        // Loop-counter suffixes come from global unique-name numbering, which shifts when
+        // element ordering changes; only the numeric-for shape matters here.
+        assertTrue("an ascending range is a numeric for:\n" + up,
+            java.util.regex.Pattern.compile("for i\\d* = 0, ").matcher(up).find());
         assertFalse("no counted while loop is left:\n" + up, up.contains("while true do"));
         String down = topLevelFunctionBodyWithPrefix(compiled, "down");
         assertTrue("a descending range counts down with a negative step:\n" + down,

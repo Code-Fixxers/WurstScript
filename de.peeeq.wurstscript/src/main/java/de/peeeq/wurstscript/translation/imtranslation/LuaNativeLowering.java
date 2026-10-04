@@ -222,9 +222,10 @@ public final class LuaNativeLowering {
         lowerKeyedTables(prog, translator);
 
         removeRedundantTypeAssurance(prog, translator);
-        lowerStringConcatenation(prog, translator);
-        lowerDivMod(prog, translator);
+
         lowerRealToInt(prog, translator);
+
+        DivModFunctions funcs = new DivModFunctions(translator);
 
         // Maps original BJ function → replacement (IS_NATIVE stub or nil-safety wrapper).
         // Populated lazily during the traversal.
@@ -240,6 +241,51 @@ public final class LuaNativeLowering {
         List<ImFunction> deferredAdditions = new ArrayList<>();
 
         prog.accept(new Element.DefaultVisitor() {
+            // String concatenation and div/mod lowering ride along in this same traversal
+            // instead of sweeping the program twice more: each handles disjoint node shapes
+            // (operator calls vs BJ function calls), so folding them in changes nothing
+            // except the traversal count (ordering constraints are noted at the
+            // removed per-pass methods' former location below).
+            @Override
+            public void visit(ImOperatorCall call) {
+                super.visit(call);
+                ImExprs args = call.getArguments();
+                if (call.getOp() == WurstOperator.PLUS && args.size() == 2
+                    && TypesHelper.isStringType(args.get(0).attrTyp())
+                    && TypesHelper.isStringType(args.get(1).attrTyp())) {
+                    call.replaceBy(callWithStacktrace(call.attrTrace(), translator.stringConcatFunc, args.copy()));
+                    return;
+                }
+                if (args.size() != 2) {
+                    return;
+                }
+                ImFunction target;
+                if (call.getOp() == WurstOperator.DIV_INT) {
+                    if (isIntentionalThreadAbortDivByZero(call)) {
+                        return;
+                    }
+                    target = funcs.intDiv();
+                } else if (call.getOp() == WurstOperator.MOD_INT) {
+                    ImExpr dividend = call.getArguments().get(0);
+                    ImExpr divisor = call.getArguments().get(1);
+                    if (divisor instanceof ImIntVal && ((ImIntVal) divisor).getValI() > 0
+                        && !(dividend instanceof ImIntVal)) {
+                        target = funcs.rawFloorModInt();
+                    } else {
+                        target = funcs.modInt();
+                    }
+                } else if (call.getOp() == WurstOperator.MOD_REAL) {
+                    target = funcs.modReal();
+                } else if (call.getOp() == WurstOperator.JASS_MOD_INT) {
+                    target = funcs.jassModInt();
+                } else {
+                    return;
+                }
+                List<ImExpr> removedArgs = call.getArguments().removeAll();
+                call.replaceBy(JassIm.ImFunctionCall(call.attrTrace(), target,
+                    JassIm.ImTypeArguments(), JassIm.ImExprs(removedArgs), false, CallType.NORMAL));
+            }
+
             @Override
             public void visit(ImFunctionCall call) {
                 super.visit(call);
@@ -313,6 +359,7 @@ public final class LuaNativeLowering {
         // Add all generated functions after the traversal so their bodies are not visited
         // by the replacement visitor above.
         prog.getFunctions().addAll(deferredAdditions);
+        prog.getFunctions().addAll(funcs.createdFunctions());
     }
 
     /**
@@ -354,100 +401,22 @@ public final class LuaNativeLowering {
         }
     }
 
-    /**
-     * Rewrites string PLUS before the optimizer's first garbage-collection
-     * pass. The concat helper is an ordinary IM function, so introducing its
-     * calls only later in EliminateLocalTypes would let the optimizer remove
-     * its definition first and leave dangling Lua calls behind.
-     */
-    private static void lowerStringConcatenation(ImProg prog, ImTranslator translator) {
-        prog.accept(new Element.DefaultVisitor() {
-            @Override
-            public void visit(ImOperatorCall call) {
-                super.visit(call);
-                ImExprs args = call.getArguments();
-                if (call.getOp() == WurstOperator.PLUS && args.size() == 2
-                    && TypesHelper.isStringType(args.get(0).attrTyp())
-                    && TypesHelper.isStringType(args.get(1).attrTyp())) {
-                    call.replaceBy(callWithStacktrace(call.attrTrace(), translator.stringConcatFunc, args.copy()));
-                }
-            }
-        });
-    }
+    // Note (ordering constraints, preserved from the previously separate passes):
+    // - String PLUS is rewritten here, before the optimizer's first garbage-collection
+    //   pass: the concat helper is an ordinary IM function, so introducing its calls only
+    //   later in EliminateLocalTypes would let the optimizer remove its definition first
+    //   and leave dangling Lua calls behind.
+    // - DIV_INT/MOD_INT/MOD_REAL/JASS_MOD_INT become calls against small portable IM
+    //   functions (not natives) so they live in the tree before inlining and dead-code
+    //   elimination. Constant-constant cases already fold away earlier and never reach
+    //   this rewrite. Exception: I2S(1 div 0) is ErrorHandling's deliberate crash trap;
+    //   the Lua emitter pattern-matches that exact operator shape into the
+    //   __wurst_abort_thread sentinel, so it is left untouched here.
+    // - For a positive constant divisor the ModuloInteger correction is exactly Lua's
+    //   floored %, one VM opcode instead of a C call and a branch. A constant dividend
+    //   keeps the helper so the optimizer can still fold the whole expression.
 
     private static final de.peeeq.wurstscript.ast.Element SYNTHETIC_TRACE = de.peeeq.wurstscript.ast.Ast.NoExpr();
-
-    /**
-     * Rewrites {@code DIV_INT}/{@code MOD_INT}/{@code MOD_REAL}/{@code JASS_MOD_INT} operator calls
-     * into calls against small, portable IM functions (not natives), instead
-     * of them being lowered directly to opaque, always-emitted Lua helper
-     * functions at Lua-emission time (after {@code ImOptimizer} has already
-     * run). Because these functions now live in the IM tree before inlining
-     * and dead-code elimination, non-constant div/mod at a hot call site can
-     * actually get inlined, and the helpers disappear entirely from programs
-     * that never use div/mod - both of which were previously impossible.
-     *
-     * <p>Constant-constant div/mod already folds away earlier (see
-     * {@code SimpleRewrites}/{@code ConstantAndCopyPropagation}) and never
-     * reaches this rewrite; this only applies to runtime-value operands.
-     *
-     * <p>Exception: {@code I2S(1 div 0)} is ErrorHandling's deliberate,
-     * always-non-constant-looking crash trap - {@code
-     * lua.translation.ExprTranslation#translate(ImFunctionCall, ...)} pattern
-     * matches that exact {@code ImOperatorCall(DIV_INT, [1, 0])} shape as the
-     * sole argument of an {@code I2S} call and turns it into the {@code
-     * __wurst_abort_thread} sentinel every callback xpcall handler ignores.
-     * Lowering it here first would replace that shape with a call to the
-     * portable {@code __wurst_intDiv} helper, which the sentinel check does
-     * not recognize - the trap would then raise a real Lua {@code n//0}
-     * runtime error instead of the sentinel, breaking every callback error
-     * handler's "was this an intentional abort" check. Leave that one
-     * expression untouched so the existing recognition still fires.
-     */
-    private static void lowerDivMod(ImProg prog, ImTranslator translator) {
-        DivModFunctions funcs = new DivModFunctions(translator);
-        prog.accept(new Element.DefaultVisitor() {
-            @Override
-            public void visit(ImOperatorCall call) {
-                super.visit(call);
-                if (call.getArguments().size() != 2) {
-                    return;
-                }
-                ImFunction target;
-                if (call.getOp() == WurstOperator.DIV_INT) {
-                    if (isIntentionalThreadAbortDivByZero(call)) {
-                        return;
-                    }
-                    target = funcs.intDiv();
-                } else if (call.getOp() == WurstOperator.MOD_INT) {
-                    // For a positive constant divisor the ModuloInteger correction is exactly Lua's
-                    // floored %, one VM opcode instead of a C call and a branch. A constant dividend
-                    // keeps the helper so the optimizer can still fold the whole expression.
-                    ImExpr dividend = call.getArguments().get(0);
-                    ImExpr divisor = call.getArguments().get(1);
-                    if (divisor instanceof ImIntVal && ((ImIntVal) divisor).getValI() > 0
-                        && !(dividend instanceof ImIntVal)) {
-                        target = funcs.rawFloorModInt();
-                    } else {
-                        target = funcs.modInt();
-                    }
-                } else if (call.getOp() == WurstOperator.MOD_REAL) {
-                    target = funcs.modReal();
-                } else if (call.getOp() == WurstOperator.JASS_MOD_INT) {
-                    target = funcs.jassModInt();
-                } else {
-                    return;
-                }
-                List<ImExpr> args = call.getArguments().removeAll();
-                call.replaceBy(JassIm.ImFunctionCall(call.attrTrace(), target,
-                    JassIm.ImTypeArguments(), JassIm.ImExprs(args), false, CallType.NORMAL));
-            }
-        });
-        // Added only after the traversal completes - prog.getFunctions() is
-        // being iterated by the accept() call above, same reasoning as
-        // deferredAdditions in transform().
-        prog.getFunctions().addAll(funcs.createdFunctions());
-    }
 
     /**
      * Rewrites calls to the native {@code R2I} to {@code __wurst_R2I}, which truncates in Lua arithmetic:

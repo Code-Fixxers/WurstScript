@@ -38,8 +38,10 @@ public class FunctionSplitter {
         Preconditions.checkArgument(func.getReturnType() instanceof ImVoid, "func must return void");
         // run some basic optimizations first:
         func.flatten(tr);
+        // Only the split function and its callees are queried below; analyzing the whole
+        // program here costs O(program) per split function.
         LocalPlayerContextAnalyzer localPlayerContextAnalyzer =
-            new LocalPlayerContextAnalyzer(tr.getImProg());
+            new LocalPlayerContextAnalyzer(tr.getImProg(), Collections.singleton(func));
         new ConstantAndCopyPropagation().optimizeFunc(func, localPlayerContextAnalyzer);
 //        new TempMerger().optimizeFunc(func);
         new LocalMerger().optimizeFunc(func, localPlayerContextAnalyzer, tr);

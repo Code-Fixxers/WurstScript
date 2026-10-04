@@ -142,11 +142,32 @@ public class EliminateGenerics {
         // Specialising a constructor makes its result type concrete, which is what lets a method
         // call on that result resolve. Repeat until a pass finds nothing new; collection is
         // idempotent, so this terminates once every reachable site has been rewritten.
+        // Only functions and classes created by the previous pass are rescanned: rescanning
+        // the whole program per iteration is quadratic in the number of fixpoint rounds.
+        int lastScannedFuncIndex = 0;
+        int lastScannedClassIndex = 0;
+        boolean firstIter = true;
         while (true) {
             if (specializeTupleValueTypes) {
                 collectRuntimeTypeSpecializations();
             }
-            collectGenericNewRoots();
+            if (firstIter) {
+                collectGenericNewRoots();
+                lastScannedFuncIndex = prog.getFunctions().size();
+                lastScannedClassIndex = prog.getClasses().size();
+                firstIter = false;
+            } else {
+                int curFuncCount = prog.getFunctions().size();
+                int curClassCount = prog.getClasses().size();
+                if (curFuncCount <= lastScannedFuncIndex && curClassCount <= lastScannedClassIndex) {
+                    break;
+                }
+                List<ImFunction> newFuncs = new ArrayList<>(prog.getFunctions().subList(lastScannedFuncIndex, curFuncCount));
+                List<ImClass> newClasses = new ArrayList<>(prog.getClasses().subList(lastScannedClassIndex, curClassCount));
+                lastScannedFuncIndex = curFuncCount;
+                lastScannedClassIndex = curClassCount;
+                collectGenericNewRoots(newFuncs, newClasses);
+            }
             if (genericsUses.isEmpty()) {
                 break;
             }
@@ -256,11 +277,16 @@ public class EliminateGenerics {
 
 
     private void collectGenericNewRoots() {
+        collectGenericNewRoots(prog.getFunctions(), prog.getClasses());
+    }
+
+    private void collectGenericNewRoots(List<ImFunction> funcs, List<ImClass> classes) {
         classByFunction = null;
-        prog.accept(new Element.DefaultVisitor() {
+        Element.DefaultVisitor visitor = new Element.DefaultVisitor() {
             @Override
             public void visit(ImFunction function) {
-                if (!function.getTypeVariables().isEmpty()
+                if (function.isNative() || function.getBody().isEmpty()
+                    || !function.getTypeVariables().isEmpty()
                     || unspecializedGenericClassMethods.contains(function)) {
                     return;
                 }
@@ -314,7 +340,13 @@ public class EliminateGenerics {
                 super.visit(typeId);
                 collectGenericNewUse(typeId);
             }
-        });
+        };
+        for (ImClass c : classes) {
+            c.accept(visitor);
+        }
+        for (ImFunction f : funcs) {
+            f.accept(visitor);
+        }
     }
 
     /**
@@ -366,17 +398,29 @@ public class EliminateGenerics {
         }
     }
 
+    private final Map<RuntimeTypeUse, Boolean> runtimeTypeSpecializationCache = new HashMap<>();
+
     private boolean needsRuntimeTypeSpecialization(ImClassType clazz) {
-        if (typeArgumentsContainTypeVariable(clazz.getTypeArguments())) {
+        if (runtimeTypeSpecializations.isEmpty() || typeArgumentsContainTypeVariable(clazz.getTypeArguments())) {
             return false;
         }
-        return needsRuntimeTypeSpecialization(clazz.getClassDef(),
-            new GenericTypes(clazz.getTypeArguments()),
+        RuntimeTypeUse key = new RuntimeTypeUse(clazz.getClassDef(), new GenericTypes(clazz.getTypeArguments()));
+        Boolean cached = runtimeTypeSpecializationCache.get(key);
+        if (cached != null) {
+            return cached;
+        }
+        boolean result = needsRuntimeTypeSpecialization(clazz.getClassDef(),
+            key.generics(),
             new HashSet<>());
+        runtimeTypeSpecializationCache.put(key, result);
+        return result;
     }
 
     private boolean needsRuntimeTypeSpecialization(ImClass clazz, GenericTypes generics,
                                                    Set<RuntimeTypeUse> visited) {
+        if (runtimeTypeSpecializations.isEmpty()) {
+            return false;
+        }
         if (!visited.add(new RuntimeTypeUse(clazz, generics))) {
             return false;
         }
@@ -554,14 +598,38 @@ public class EliminateGenerics {
      * target keeps generics erased: specialising every call into a generic superclass would make a
      * copy per instantiation of functions with no dispatch and no construction in them.
      */
+    private Set<ImFunction> genericClassFunctions = null;
+
+    private Set<ImFunction> getGenericClassFunctions() {
+        if (genericClassFunctions == null) {
+            genericClassFunctions = Collections.newSetFromMap(new IdentityHashMap<>());
+            for (ImClass imClass : prog.getClasses()) {
+                if (!imClass.getTypeVariables().isEmpty()) {
+                    genericClassFunctions.addAll(imClass.getFunctions());
+                    for (ImMethod m : imClass.getMethods()) {
+                        if (m.getImplementation() != null) {
+                            genericClassFunctions.add(m.getImplementation());
+                        }
+                    }
+                }
+            }
+        }
+        return genericClassFunctions;
+    }
+
     private void collectCallThroughGenericReceiver(ImFunctionCall call) {
-        ImClass owningClass = classOwning(call.getFunc());
-        if (owningClass == null || owningClass.getTypeVariables().isEmpty()
-            || !call.getFunc().getTypeVariables().isEmpty()) {
+        // Fast path first: most callees are not generic-class members at all, and this avoids
+        // the owning-class lookup plus a type-attribute computation per call site.
+        if (!getGenericClassFunctions().contains(call.getFunc())) {
             return;
         }
         if (call.getArguments().isEmpty()
             || !(call.getArguments().get(0).attrTyp() instanceof ImClassType receiverType)) {
+            return;
+        }
+        ImClass owningClass = classOwning(call.getFunc());
+        if (owningClass == null || owningClass.getTypeVariables().isEmpty()
+            || !call.getFunc().getTypeVariables().isEmpty()) {
             return;
         }
         ImClassType classType = adaptToSuperclass(receiverType, owningClass);
@@ -843,9 +911,17 @@ public class EliminateGenerics {
      * Specialising these paths keeps a bounded generic as cheap on Lua as it is on Jass, at the cost
      * of one copy per instantiation actually used.
      */
+    private final Map<ImFunction, Boolean> functionNeedsSpecializationCache = new IdentityHashMap<>();
+    private final Map<ImMethod, Boolean> methodNeedsSpecializationCache = new IdentityHashMap<>();
+
     private boolean functionNeedsSpecialization(ImFunction function, Set<ImFunction> visitedFunctions,
                                                Set<ImMethod> visitedMethods) {
+        Boolean cached = functionNeedsSpecializationCache.get(function);
+        if (cached != null) {
+            return cached;
+        }
         if (needsGlobalSpecialization(function)) {
+            functionNeedsSpecializationCache.put(function, true);
             return true;
         }
         if (!visitedFunctions.add(function)) {
@@ -886,9 +962,13 @@ public class EliminateGenerics {
                 boolean dependsOnCaller = call.getTypeArguments().isEmpty()
                     || typeArgumentsContainTypeVariable(call.getTypeArguments());
                 if (constructsClassOwningGenericGlobals(function, call)
-                    || translator.isGenericNewMarker(call.getFunc())
-                    || (dependsOnCaller
-                    && functionNeedsSpecialization(call.getFunc(), visitedFunctions, visitedMethods))) {
+                    || translator.isGenericNewMarker(call.getFunc())) {
+                    found[0] = true;
+                    return;
+                }
+                if (dependsOnCaller
+                    && !visitedFunctions.contains(call.getFunc())
+                    && functionNeedsSpecialization(call.getFunc(), visitedFunctions, visitedMethods)) {
                     found[0] = true;
                     return;
                 }
@@ -900,6 +980,7 @@ public class EliminateGenerics {
                 boolean dependsOnCaller = call.getTypeArguments().isEmpty()
                     || typeArgumentsContainTypeVariable(call.getTypeArguments());
                 if (dependsOnCaller
+                    && !visitedMethods.contains(call.getMethod())
                     && methodNeedsSpecialization(call.getMethod(), visitedFunctions, visitedMethods)) {
                     found[0] = true;
                     return;
@@ -907,6 +988,13 @@ public class EliminateGenerics {
                 super.visit(call);
             }
         });
+        visitedFunctions.remove(function);
+        // Only positive results are cached. A negative answer reached while a mutually
+        // recursive callee is still on the stack would miss a later wurstNewInstance in the
+        // unfinished cycle and leave the marker in the output.
+        if (found[0]) {
+            functionNeedsSpecializationCache.put(function, true);
+        }
         return found[0];
     }
 
@@ -934,18 +1022,30 @@ public class EliminateGenerics {
 
     private boolean methodNeedsSpecialization(ImMethod method, Set<ImFunction> visitedFunctions,
                                              Set<ImMethod> visitedMethods) {
+        Boolean cached = methodNeedsSpecializationCache.get(method);
+        if (cached != null) {
+            return cached;
+        }
         if (!visitedMethods.add(method)) {
             return false;
         }
         if (method.getImplementation() != null
+            && !visitedFunctions.contains(method.getImplementation())
             && functionNeedsSpecialization(method.getImplementation(), visitedFunctions, visitedMethods)) {
+            visitedMethods.remove(method);
+            methodNeedsSpecializationCache.put(method, true);
             return true;
         }
         for (ImMethod subMethod : method.getSubMethods()) {
-            if (methodNeedsSpecialization(subMethod, visitedFunctions, visitedMethods)) {
+            if (!visitedMethods.contains(subMethod)
+                && methodNeedsSpecialization(subMethod, visitedFunctions, visitedMethods)) {
+                visitedMethods.remove(method);
+                methodNeedsSpecializationCache.put(method, true);
                 return true;
             }
         }
+        visitedMethods.remove(method);
+        // Same rule as functions: never cache a negative result from an unfinished cycle.
         return false;
     }
 
