@@ -913,32 +913,134 @@ public class EliminateGenerics {
      */
     private final Map<ImFunction, Boolean> functionNeedsSpecializationCache = new IdentityHashMap<>();
     private final Map<ImMethod, Boolean> methodNeedsSpecializationCache = new IdentityHashMap<>();
+    private final Map<Object, Boolean> needsLocal = new IdentityHashMap<>();
+    private final Map<Object, Set<Object>> needsCallers = new IdentityHashMap<>();
+    private boolean needsGraphDirty = true;
+    private int lastNeedsFuncs = -1;
+    private int lastNeedsClasses = -1;
 
     private boolean functionNeedsSpecialization(ImFunction function, Set<ImFunction> visitedFunctions,
                                                Set<ImMethod> visitedMethods) {
+        ensureNeedsEvaluated();
         Boolean cached = functionNeedsSpecializationCache.get(function);
-        if (cached != null) {
-            return cached;
+        return cached != null && cached;
+    }
+
+    private void ensureNeedsEvaluated() {
+        int funcs = prog.getFunctions().size();
+        int classes = prog.getClasses().size();
+        if (!needsGraphDirty && funcs == lastNeedsFuncs && classes == lastNeedsClasses) {
+            return;
         }
+        needsLocal.clear();
+        needsCallers.clear();
+        functionNeedsSpecializationCache.clear();
+        methodNeedsSpecializationCache.clear();
+        Set<Object> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+        for (ImFunction f : prog.getFunctions()) {
+            collectNeedsNode(f, seen);
+        }
+        for (ImClass c : prog.getClasses()) {
+            for (ImFunction f : c.getFunctions()) {
+                collectNeedsNode(f, seen);
+            }
+            for (ImMethod m : c.getMethods()) {
+                collectNeedsNode(m, seen);
+            }
+        }
+        Deque<Object> queue = new ArrayDeque<>();
+        for (Map.Entry<Object, Boolean> e : needsLocal.entrySet()) {
+            if (e.getValue()) {
+                setNeedsTrue(e.getKey());
+                queue.add(e.getKey());
+            }
+        }
+        while (!queue.isEmpty()) {
+            Object cur = queue.removeFirst();
+            Set<Object> callers = needsCallers.get(cur);
+            if (callers == null) {
+                continue;
+            }
+            for (Object caller : callers) {
+                if (!isNeedsTrue(caller)) {
+                    setNeedsTrue(caller);
+                    queue.add(caller);
+                }
+            }
+        }
+        for (Object node : needsLocal.keySet()) {
+            setNeedsFalseIfAbsent(node);
+        }
+        lastNeedsFuncs = funcs;
+        lastNeedsClasses = classes;
+        needsGraphDirty = false;
+    }
+
+    private boolean isNeedsTrue(Object node) {
+        if (node instanceof ImFunction) {
+            return Boolean.TRUE.equals(functionNeedsSpecializationCache.get(node));
+        }
+        return Boolean.TRUE.equals(methodNeedsSpecializationCache.get(node));
+    }
+
+    private void setNeedsTrue(Object node) {
+        if (node instanceof ImFunction) {
+            functionNeedsSpecializationCache.put((ImFunction) node, true);
+        } else if (node instanceof ImMethod) {
+            methodNeedsSpecializationCache.put((ImMethod) node, true);
+        }
+    }
+
+    private void setNeedsFalseIfAbsent(Object node) {
+        if (node instanceof ImFunction) {
+            functionNeedsSpecializationCache.putIfAbsent((ImFunction) node, false);
+        } else if (node instanceof ImMethod) {
+            methodNeedsSpecializationCache.putIfAbsent((ImMethod) node, false);
+        }
+    }
+
+    private void needsEdge(Object caller, Object callee) {
+        if (caller == null || callee == null) {
+            return;
+        }
+        needsLocal.putIfAbsent(caller, false);
+        needsLocal.putIfAbsent(callee, false);
+        needsCallers.computeIfAbsent(callee, k -> Collections.newSetFromMap(new IdentityHashMap<>())).add(caller);
+    }
+
+    private void collectNeedsNode(Object node, Set<Object> seen) {
+        if (!seen.add(node)) {
+            return;
+        }
+        needsLocal.putIfAbsent(node, false);
+        if (node instanceof ImMethod) {
+            ImMethod method = (ImMethod) node;
+            if (method.getImplementation() != null) {
+                needsEdge(method, method.getImplementation());
+            }
+            for (ImMethod sub : method.getSubMethods()) {
+                needsEdge(method, sub);
+            }
+            return;
+        }
+        if (!(node instanceof ImFunction)) {
+            return;
+        }
+        ImFunction function = (ImFunction) node;
         if (needsGlobalSpecialization(function)) {
-            functionNeedsSpecializationCache.put(function, true);
-            return true;
+            needsLocal.put(function, true);
         }
-        if (!visitedFunctions.add(function)) {
-            return false;
-        }
-        boolean[] found = {false};
         function.accept(new Element.DefaultVisitor() {
             @Override
             public void visit(ImTypeVarDispatch dispatch) {
-                found[0] = true;
+                needsLocal.put(function, true);
+                super.visit(dispatch);
             }
 
             @Override
             public void visit(ImInstanceof instanceOf) {
                 if (typeArgumentsContainTypeVariable(instanceOf.getClazz().getTypeArguments())) {
-                    found[0] = true;
-                    return;
+                    needsLocal.put(function, true);
                 }
                 super.visit(instanceOf);
             }
@@ -949,8 +1051,7 @@ public class EliminateGenerics {
                 // otherwise the constructor keeps a generic result type, and a method call on that
                 // result never becomes concrete enough to resolve.
                 if (classNeedsSpecialization(alloc.getClazz().getClassDef())) {
-                    found[0] = true;
-                    return;
+                    needsLocal.put(function, true);
                 }
                 super.visit(alloc);
             }
@@ -963,14 +1064,9 @@ public class EliminateGenerics {
                     || typeArgumentsContainTypeVariable(call.getTypeArguments());
                 if (constructsClassOwningGenericGlobals(function, call)
                     || translator.isGenericNewMarker(call.getFunc())) {
-                    found[0] = true;
-                    return;
-                }
-                if (dependsOnCaller
-                    && !visitedFunctions.contains(call.getFunc())
-                    && functionNeedsSpecialization(call.getFunc(), visitedFunctions, visitedMethods)) {
-                    found[0] = true;
-                    return;
+                    needsLocal.put(function, true);
+                } else if (dependsOnCaller && call.getFunc() != null) {
+                    needsEdge(function, call.getFunc());
                 }
                 super.visit(call);
             }
@@ -979,23 +1075,12 @@ public class EliminateGenerics {
             public void visit(ImMethodCall call) {
                 boolean dependsOnCaller = call.getTypeArguments().isEmpty()
                     || typeArgumentsContainTypeVariable(call.getTypeArguments());
-                if (dependsOnCaller
-                    && !visitedMethods.contains(call.getMethod())
-                    && methodNeedsSpecialization(call.getMethod(), visitedFunctions, visitedMethods)) {
-                    found[0] = true;
-                    return;
+                if (dependsOnCaller && call.getMethod() != null) {
+                    needsEdge(function, call.getMethod());
                 }
                 super.visit(call);
             }
         });
-        visitedFunctions.remove(function);
-        // Only positive results are cached. A negative answer reached while a mutually
-        // recursive callee is still on the stack would miss a later wurstNewInstance in the
-        // unfinished cycle and leave the marker in the output.
-        if (found[0]) {
-            functionNeedsSpecializationCache.put(function, true);
-        }
-        return found[0];
     }
 
     /**
@@ -1022,31 +1107,9 @@ public class EliminateGenerics {
 
     private boolean methodNeedsSpecialization(ImMethod method, Set<ImFunction> visitedFunctions,
                                              Set<ImMethod> visitedMethods) {
+        ensureNeedsEvaluated();
         Boolean cached = methodNeedsSpecializationCache.get(method);
-        if (cached != null) {
-            return cached;
-        }
-        if (!visitedMethods.add(method)) {
-            return false;
-        }
-        if (method.getImplementation() != null
-            && !visitedFunctions.contains(method.getImplementation())
-            && functionNeedsSpecialization(method.getImplementation(), visitedFunctions, visitedMethods)) {
-            visitedMethods.remove(method);
-            methodNeedsSpecializationCache.put(method, true);
-            return true;
-        }
-        for (ImMethod subMethod : method.getSubMethods()) {
-            if (!visitedMethods.contains(subMethod)
-                && methodNeedsSpecialization(subMethod, visitedFunctions, visitedMethods)) {
-                visitedMethods.remove(method);
-                methodNeedsSpecializationCache.put(method, true);
-                return true;
-            }
-        }
-        visitedMethods.remove(method);
-        // Same rule as functions: never cache a negative result from an unfinished cycle.
-        return false;
+        return cached != null && cached;
     }
 
     /**
