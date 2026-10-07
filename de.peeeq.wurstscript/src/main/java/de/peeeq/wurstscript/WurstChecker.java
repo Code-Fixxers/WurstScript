@@ -1,6 +1,7 @@
 package de.peeeq.wurstscript;
 
 import com.google.common.base.Preconditions;
+import de.peeeq.wurstio.TimeTaker;
 import de.peeeq.wurstscript.ast.CompilationUnit;
 import de.peeeq.wurstscript.ast.WurstModel;
 import de.peeeq.wurstscript.attributes.ErrorHandler;
@@ -18,15 +19,22 @@ public class WurstChecker {
     private final WurstGui gui;
     private final ErrorHandler errorHandler;
     private final boolean legacyJassTypeChecks;
+    private final TimeTaker timeTaker;
 
     public WurstChecker(WurstGui gui, ErrorHandler errorHandler) {
         this(gui, errorHandler, false);
     }
 
     public WurstChecker(WurstGui gui, ErrorHandler errorHandler, boolean legacyJassTypeChecks) {
+        this(gui, errorHandler, legacyJassTypeChecks, new TimeTaker.Default());
+    }
+
+    public WurstChecker(WurstGui gui, ErrorHandler errorHandler, boolean legacyJassTypeChecks,
+                        TimeTaker timeTaker) {
         this.gui = gui;
         this.errorHandler = errorHandler;
         this.legacyJassTypeChecks = legacyJassTypeChecks;
+        this.timeTaker = timeTaker != null ? timeTaker : new TimeTaker.Default();
     }
 
     public void checkProg(WurstModel root, Collection<CompilationUnit> toCheck) {
@@ -35,7 +43,7 @@ public class WurstChecker {
         if (root.isEmpty()) {
             return;
         }
-        new DesugarArrayLength().run(root);
+        timeTaker.measure("desugar array length", () -> new DesugarArrayLength().run(root));
         gui.sendProgress("Checking Files");
 
         if (errorHandler.getErrorCount() > 0) return;
@@ -43,25 +51,31 @@ public class WurstChecker {
         attachErrorHandler(root);
         clearGlobalCaches(root, toCheck);
 
-        expandModules(root);
+        timeTaker.measure("expand modules", () -> expandModules(root));
 
         if (errorHandler.getErrorCount() > 0) return;
 
         SyntacticSugar syntacticSugar = new SyntacticSugar();
         List<SyntacticSugar.DeferredModuleCall> detachedTemplates = new ArrayList<>();
-        for (CompilationUnit cu : toCheck) {
-            syntacticSugar.expandFieldIterations(cu);
-            detachedTemplates.addAll(syntacticSugar.detachModuleTemplateFieldIterations(cu));
-        }
+        timeTaker.measure("syntactic sugar", () -> {
+            for (CompilationUnit cu : toCheck) {
+                syntacticSugar.expandFieldIterations(cu);
+                detachedTemplates.addAll(syntacticSugar.detachModuleTemplateFieldIterations(cu));
+            }
+        });
         try {
             // compute the flow attributes
-            for (CompilationUnit cu : toCheck) {
-                WurstValidator.computeFlowAttributes(cu);
-            }
+            timeTaker.measure("flow attributes", () -> {
+                for (CompilationUnit cu : toCheck) {
+                    WurstValidator.computeFlowAttributes(cu);
+                }
+            });
 
             // validate the resource:
-            WurstValidator validator = new WurstValidator(root, legacyJassTypeChecks);
-            validator.validate(toCheck);
+            timeTaker.measure("validate", () -> {
+                WurstValidator validator = new WurstValidator(root, legacyJassTypeChecks, timeTaker);
+                validator.validate(toCheck);
+            });
         } finally {
             syntacticSugar.restoreModuleTemplateFieldIterations(detachedTemplates);
         }

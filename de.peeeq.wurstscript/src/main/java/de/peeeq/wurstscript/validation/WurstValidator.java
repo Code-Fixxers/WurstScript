@@ -64,6 +64,7 @@ public class WurstValidator {
     private final Map<GlobalVarDef, List<GlobalVarDef>> moduleFieldCopiesCache = new IdentityHashMap<>();
     private NamePreservation.RuntimeNameIndex runtimeNameIndex;
     private boolean moduleFieldCopiesIndexed;
+    private final de.peeeq.wurstio.TimeTaker timeTaker;
 
     /**
      * When true, the build targets a legacy patch (pre-1.24) whose Blizzard-provided
@@ -77,31 +78,39 @@ public class WurstValidator {
     }
 
     public WurstValidator(WurstModel root, boolean legacyJassTypeChecks) {
+        this(root, legacyJassTypeChecks, new de.peeeq.wurstio.TimeTaker.Default());
+    }
+
+    public WurstValidator(WurstModel root, boolean legacyJassTypeChecks,
+                          de.peeeq.wurstio.TimeTaker timeTaker) {
         this.prog = root;
         this.legacyJassTypeChecks = legacyJassTypeChecks;
+        this.timeTaker = timeTaker != null ? timeTaker : new de.peeeq.wurstio.TimeTaker.Default();
     }
 
     public void validate(Collection<CompilationUnit> toCheck) {
         try {
-            functionCount = countFunctions(toCheck);
-            visitedFunctions = 0;
-            heavyFunctions.clear();
-            heavyBlocks.clear();
-            guaranteedClassFieldInitCache.clear();
-            moduleFieldCopiesCache.clear();
-            moduleFieldCopiesIndexed = false;
-            trveWrapperFuncs.clear();
-            wrapperCalls.clear();
-            NamePreservation.clearSyntheticMarkers(prog);
-            runtimeNameIndex = NamePreservation.indexGlobals(prog);
-            recomputeTrvePreservation();
+            timeTaker.measure("validation setup", () -> {
+                functionCount = countFunctions(toCheck);
+                visitedFunctions = 0;
+                heavyFunctions.clear();
+                heavyBlocks.clear();
+                guaranteedClassFieldInitCache.clear();
+                moduleFieldCopiesCache.clear();
+                moduleFieldCopiesIndexed = false;
+                trveWrapperFuncs.clear();
+                wrapperCalls.clear();
+                NamePreservation.clearSyntheticMarkers(prog);
+                runtimeNameIndex = NamePreservation.indexGlobals(prog);
+                recomputeTrvePreservation();
+            });
 
-            lightValidation(toCheck);
+            timeTaker.measure("light validation", () -> lightValidation(toCheck));
 
-            heavyValidation();
+            timeTaker.measure("heavy validation", this::heavyValidation);
 
             prog.getErrorHandler().setProgress("Post checks", 0.55);
-            postChecks(toCheck);
+            timeTaker.measure("post checks", () -> postChecks(toCheck));
 
         } catch (RuntimeException e) {
             WLogger.severe(e);

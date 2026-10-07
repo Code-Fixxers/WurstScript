@@ -3298,6 +3298,46 @@ public class LuaTranslationTests extends WurstScriptTest {
     }
 
     @Test
+    public void repeatedCompilesAreByteIdentical() {
+        // Locks ordinary-path determinism: fresh compilers over identical input must emit
+        // identical scripts (dispatch slots, adapter names and suffixes, specialization
+        // copies). Perturbing work in between keeps allocator/identity-hash histories from
+        // repeating trivially.
+        String[] fixture = {
+            "package Test",
+            "@extern native Callback(code c) returns int",
+            "function alpha() returns int",
+            "    return 1",
+            "function beta() returns int",
+            "    return 2",
+            "int array counters",
+            "public class Base",
+            "    int x = 0",
+            "    function get() returns int",
+            "        return this.x",
+            "public class Sub extends Base",
+            "    override function get() returns int",
+            "        return this.x + 1",
+            "public class Box<T>",
+            "    T val",
+            "    function get() returns T",
+            "        return this.val",
+            "init",
+            "    Callback(function alpha)",
+            "    Callback(function beta)",
+            "    Callback(() -> skip)",
+            "    counters[3] = 7",
+            "    Base s = new Sub()",
+            "    let b = new Box<int>()",
+            "    int sink = s.get() + counters[3] + b.get()"
+        };
+        String first = compileLuaWithRunArgs("repeatedCompilesAreByteIdentical", false, fixture);
+        test().lines("package Perturb", "native testSuccess()", "init", "    testSuccess()");
+        String second = compileLuaWithRunArgs("repeatedCompilesAreByteIdentical", false, fixture);
+        assertEquals(second, first);
+    }
+
+    @Test
     public void luaFunctionRefAdapterTracksLateClassFunctionRename() {
         String compiled = compileLuaWithCUs(
             "LuaTranslationTests_luaFunctionRefAdapterTracksLateClassFunctionRename",

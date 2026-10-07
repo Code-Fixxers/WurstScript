@@ -3347,4 +3347,37 @@ public class OptimizerTests extends WurstScriptTest {
         }
         assertTrue(callSurvives[0], "the call's side effect must survive the dead assignment");
     }
+
+    /**
+     * Scale guard for dense functions: optimizer cost is driven by per-function body
+     * size (liveness is super-quadratic in statements x locals), not by function count.
+     * A 100-local function with a hot loop must compile in seconds and compute the right
+     * value under every optimization level (the builder runs all of them, each executed).
+     * The generous timeout is the anti-blowup assertion: it only trips on pathological
+     * (100x) slowdowns or hangs, never on ordinary machine variance.
+     */
+    @Test(timeOut = 120_000)
+    public void denseFunctionCompilesQuicklyAndRunsCorrectly() {
+        java.util.List<String> lines = new java.util.ArrayList<>();
+        lines.add("package Test");
+        lines.add("native testSuccess()");
+        lines.add("int g = 3");
+        lines.add("function dense() returns int");
+        for (int i = 0; i < 100; i++) {
+            lines.add("    int v" + i + " = g * " + (i + 1));
+        }
+        lines.add("    int acc = 0");
+        lines.add("    for k = 0 to 20");
+        for (int i = 0; i < 100; i++) {
+            lines.add("        acc = acc + v" + i + " + k");
+        }
+        lines.add("    return acc");
+        lines.add("init");
+        // sum(v) = 3 * (1+...+100) = 15150; 21 iterations add 15150 + 100*k each:
+        // 21*15150 + 100*(0+...+20) = 318150 + 21000 = 339150.
+        lines.add("    if dense() == 339150");
+        lines.add("        testSuccess()");
+        test().testLua(true).inline().localOptimizations().executeProg()
+            .lines(lines.toArray(new String[0]));
+    }
 }
