@@ -443,44 +443,82 @@ public class LocalMerger implements LocalPlayerAwareOptimizerPass {
         @SuppressWarnings("unchecked") final ObjectOpenHashSet<ImVar>[] out = new ObjectOpenHashSet[N];
         for (int i = 0; i < N; i++) { in[i] = new ObjectOpenHashSet<>(); out[i] = new ObjectOpenHashSet<>(); }
 
-        // 5. Iterate over SCCs in reverse topological order
+        // 5. Iterate over SCCs in reverse topological order.
+        // Within one SCC, propagate with a backward worklist instead of rescanning every
+        // node per round: when IN[u] changes only its predecessors can change, so each edge
+        // is revisited only while facts still flow across it. Same equations and same least
+        // fixpoint as the round-robin iteration, reached in far fewer visits (straight-line
+        // code settles in a single back-to-front pass). IN sets only ever grow, so any
+        // visitation order terminates at the same fixpoint.
+        boolean[] queued = new boolean[N];
+        ArrayDeque<Node> work = new ArrayDeque<>();
         for (int sccIndex = 0; sccIndex < sccs.size(); sccIndex++) {
             List<Node> scc = sccs.get(sccIndex);
             if (scc.isEmpty()) continue;
 
-            // Iterate within this SCC until a fixed point is reached for all its nodes.
-            boolean changedInScc = true;
-            while (changedInScc) {
-                changedInScc = false;
-                for (int uIndex = 0; uIndex < scc.size(); uIndex++) {
-                    Node u_node = scc.get(uIndex);
-                    int u_idx = idx.getInt(u_node);
-
-                    // Recalculate OUT[u] from the IN sets of its successors.
-                    // Any successor not in the current SCC has already been processed and its IN set is stable.
-                    final ObjectOpenHashSet<ImVar> newOut = new ObjectOpenHashSet<>();
-                    for (Node succ : u_node.getSuccessors()) {
-                        int v_idx = idx.getInt(succ);
-                        if (v_idx != -1) {
-                            newOut.addAll(in[v_idx]);
+            // Seed back-to-front so straight-line facts propagate in one pass.
+            // Singletons need no ordering; sorting every one of them would cost more
+            // than the single visit each takes.
+            if (scc.size() == 1) {
+                Node u = scc.get(0);
+                int uIdx = idx.getInt(u);
+                if (!queued[uIdx]) {
+                    queued[uIdx] = true;
+                    work.add(u);
+                }
+            } else {
+                scc.stream()
+                    .sorted(Comparator.comparingInt(idx::getInt).reversed())
+                    .forEachOrdered(u -> {
+                        int uIdx = idx.getInt(u);
+                        if (!queued[uIdx]) {
+                            queued[uIdx] = true;
+                            work.add(u);
                         }
+                    });
+            }
+            while (!work.isEmpty()) {
+                Node uNode = work.poll();
+                int uIdx = idx.getInt(uNode);
+                queued[uIdx] = false;
+
+                // OUT[u] from the IN sets of its successors. Successors outside this SCC
+                // were processed in an earlier SCC and their IN sets are stable.
+                ObjectOpenHashSet<ImVar> newOut = new ObjectOpenHashSet<>();
+                for (Node succ : uNode.getSuccessors()) {
+                    int vIdx = idx.getInt(succ);
+                    if (vIdx != -1) {
+                        newOut.addAll(in[vIdx]);
                     }
-                    out[u_idx] = newOut;
+                }
 
-                    // Recalculate IN[u] using the data-flow equation: in[u] = use[u] U (out[u] - def[u])
-                    final ObjectOpenHashSet<ImVar> oldIn = in[u_idx];
-                    final ObjectOpenHashSet<ImVar> newIn = new ObjectOpenHashSet<>();
-                    newIn.addAll(newOut);
-                    newIn.removeAll(def[u_idx]);
-                    newIn.addAll(use[u_idx]);
+                // IN[u] = use[u] U (OUT[u] - def[u]).
+                ObjectOpenHashSet<ImVar> newIn = new ObjectOpenHashSet<>(newOut);
+                newIn.removeAll(def[uIdx]);
+                newIn.addAll(use[uIdx]);
 
-                    // If IN[u] changed, update it and flag that we need another iteration for this SCC.
-                    if (!newIn.equals(oldIn)) {
-                        in[u_idx] = newIn;
-                        changedInScc = true;
+                if (!newIn.equals(in[uIdx])) {
+                    in[uIdx] = newIn;
+                    for (Node pred : uNode.getPredecessors()) {
+                        int pIdx = idx.getInt(pred);
+                        if (pIdx != -1 && !queued[pIdx]) {
+                            queued[pIdx] = true;
+                            work.add(pred);
+                        }
                     }
                 }
             }
+        }
+        // OUT values for the result map: one final pass now that all IN sets are stable.
+        for (int i = 0; i < N; i++) {
+            ObjectOpenHashSet<ImVar> outI = new ObjectOpenHashSet<>();
+            for (Node succ : nodes.get(i).getSuccessors()) {
+                int vIdx = idx.getInt(succ);
+                if (vIdx != -1) {
+                    outI.addAll(in[vIdx]);
+                }
+            }
+            out[i] = outI;
         }
 
         // 6. Collect results into the final map format
